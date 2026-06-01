@@ -25,7 +25,7 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app)
 
-client = Groq(api_key="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")
+client = Groq(api_key="api key")
 
 
 # ── OCR ───────────────────────────────────────────────────────────────────────
