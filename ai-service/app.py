@@ -2,418 +2,349 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from groq import Groq
 from dotenv import load_dotenv
-import os
-import json
-import base64
-import io
-import zipfile
-from datetime import datetime, timezone
+import os, json, base64, io, zipfile, time, traceback
 
 import pytesseract
 from pdf2image import convert_from_bytes
-from PIL import Image
 
 from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, PageBreak
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable, Table, TableStyle
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.lib import colors
-from pypdf import PdfWriter, PdfReader
 
 load_dotenv()
-
 app = Flask(__name__)
 CORS(app)
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
-client = Groq(api_key="api key")
+MODEL = "llama-3.1-8b-instant"
 
 
-# ── OCR ───────────────────────────────────────────────────────────────────────
-def extract_text_with_ocr(pdf_bytes):
+# ── OCR ────────────────────────────────────────────────────────────────────
+def extract_text_with_ocr(pdf_bytes: bytes) -> str:
     try:
-        images = convert_from_bytes(pdf_bytes)
-        text = ''
-        for img in images:
-            text += pytesseract.image_to_string(img)
-        return text.strip()
+        return "\n".join(pytesseract.image_to_string(img) for img in convert_from_bytes(pdf_bytes)).strip()
     except Exception:
-        return ''
+        return ""
 
 
-# ── AI: analyze resume vs job description ─────────────────────────────────────
-@app.route('/ai/analyze', methods=['POST'])
-def analyze():
-    data = request.json
-    job_description = data.get('jobDescription', '')
-    resume_text = data.get('resumeText', '')
-    pdf_bytes = data.get('pdfBase64', None)
-
-    if pdf_bytes:
-        pdf_data = base64.b64decode(pdf_bytes)
-        resume_text = extract_text_with_ocr(pdf_data)
-
-    prompt = f"""
-    You are an expert recruiter. Determine if the provided document is a resume/CV.
-
-    Job Description: {job_description}
-    Document Text: {resume_text if resume_text.strip() else "TEXT COULD NOT BE EXTRACTED - LIKELY AN IMAGE-BASED PDF"}
-
-    Rules:
-    - If text is empty or says "TEXT COULD NOT BE EXTRACTED", mark is_resume as true and give a score of 50
-    - If text clearly shows it's NOT a resume (like a task list, article, report), mark is_resume as false
-    - If it looks like a resume, analyze it properly
-
-    Return ONLY a valid JSON object:
-    - is_resume: boolean
-    - match_score: integer 0-100
-    - skill_gaps: array
-    - strengths: array
-    - summary: string
-
-    No markdown, just JSON.
-    """
-
+# ── Groq helper ────────────────────────────────────────────────────────────
+def groq_json(prompt: str) -> dict:
     response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"}
-    )
-
-    result = json.loads(response.choices[0].message.content)
-    return jsonify(result)
-
-
-# ── AI: extract structured resume data ───────────────────────────────────────
-def extract_resume_structure(resume_text: str) -> dict:
-    prompt = f"""
-You are a resume parser. Extract ALL content from this resume text into structured JSON.
-Keep every single detail — do not summarize or skip anything.
-
-Resume Text:
-{resume_text}
-
-Return ONLY a valid JSON object with these fields (use empty string or empty array if not found):
-{{
-  "full_name": "string",
-  "email": "string",
-  "phone": "string",
-  "location": "string",
-  "linkedin": "string",
-  "github": "string",
-  "website": "string",
-  "summary": "string — full objective/summary paragraph",
-  "education": [
-    {{
-      "degree": "string",
-      "institution": "string",
-      "year": "string",
-      "grade": "string",
-      "details": "string — any extra info"
-    }}
-  ],
-  "experience": [
-    {{
-      "title": "string",
-      "company": "string",
-      "duration": "string",
-      "location": "string",
-      "points": ["string", "string"]
-    }}
-  ],
-  "projects": [
-    {{
-      "name": "string",
-      "tech": "string",
-      "points": ["string", "string"],
-      "link": "string"
-    }}
-  ],
-  "skills": {{
-    "languages": "string",
-    "frameworks": "string",
-    "tools": "string",
-    "other": "string"
-  }},
-  "certifications": ["string"],
-  "achievements": ["string"],
-  "extra_sections": [
-    {{
-      "title": "string",
-      "content": "string"
-    }}
-  ]
-}}
-
-No markdown, just JSON.
-"""
-    response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+        model=MODEL,
         messages=[{"role": "user", "content": prompt}],
         response_format={"type": "json_object"}
     )
     return json.loads(response.choices[0].message.content)
 
 
-# ── ReportLab styles ──────────────────────────────────────────────────────────
-def get_styles():
-    PURPLE = colors.HexColor("#6d28d9")
-    DARK   = colors.HexColor("#1a1a1a")
-    MUTED  = colors.HexColor("#555555")
-    LIGHT  = colors.HexColor("#888880")
-
-    return {
-        "name":     ParagraphStyle("name",     fontName="Helvetica-Bold",  fontSize=20, leading=24, textColor=DARK),
-        "contact":  ParagraphStyle("contact",  fontName="Helvetica",       fontSize=8,  leading=12, textColor=LIGHT),
-        "h1":       ParagraphStyle("h1",       fontName="Helvetica-Bold",  fontSize=10, leading=13, textColor=PURPLE, spaceBefore=6, spaceAfter=2),
-        "body":     ParagraphStyle("body",     fontName="Helvetica",       fontSize=9,  leading=13, textColor=DARK),
-        "bold":     ParagraphStyle("bold",     fontName="Helvetica-Bold",  fontSize=9,  leading=13, textColor=DARK),
-        "muted":    ParagraphStyle("muted",    fontName="Helvetica",       fontSize=8,  leading=12, textColor=MUTED),
-        "bullet":   ParagraphStyle("bullet",   fontName="Helvetica",       fontSize=9,  leading=13, textColor=DARK,   leftIndent=12),
-        "small":    ParagraphStyle("small",    fontName="Helvetica",       fontSize=8,  leading=11, textColor=LIGHT),
-    }
+# ── Safe string ────────────────────────────────────────────────────────────
+def s(val) -> str:
+    return str(val).strip() if val is not None else ""
 
 
-def hr(W):
-    return HRFlowable(width=W, thickness=0.4, color=colors.HexColor("#e8e5de"), spaceAfter=4)
+# ── Analyze endpoint ───────────────────────────────────────────────────────
+@app.route("/ai/analyze", methods=["POST"])
+def analyze():
+    data = request.json
+    job_description = data.get("jobDescription", "")
+    resume_text = data.get("resumeText", "")
+    pdf_b64 = data.get("pdfBase64")
+
+    if pdf_b64:
+        resume_text = extract_text_with_ocr(base64.b64decode(pdf_b64))
+
+    doc_text = resume_text.strip() or "TEXT COULD NOT BE EXTRACTED - LIKELY AN IMAGE-BASED PDF"
+
+    prompt = f"""You are an expert recruiter. Decide if the document is a resume/CV.
+
+Job Description:
+{job_description}
+
+Document Text:
+{doc_text}
+
+STEP 1 — IS THIS A RESUME?
+Mark is_resume as FALSE immediately if the document is any of:
+- A study plan, grind plan, learning roadmap, or weekly schedule
+  (contains phrases like "Week 1", "Day 1", "hrs/day", "Daily Schedule",
+   "10-Week", "phase 1", "time block", "LPA target", "roadmap", "grind plan")
+- A task list, to-do list, or project plan
+- An article, blog post, research paper, invoice, or report
+- Any document describing a PLAN or SCHEDULE rather than a PERSON's background
+
+Mark is_resume as TRUE only if ALL of these are present:
+- A person's name
+- Contact info (email or phone)
+- At least one of: work experience, education, or skills section
+
+If text is empty or unreadable: is_resume=true, score=50.
+
+STEP 2 — If is_resume is true, score it against the job description.
+
+CRITICAL JSON RULES:
+- Double quotes only — NO apostrophes inside strings (write "candidates background" not "candidate's background")
+- No newlines inside string values
+- summary = one plain sentence, no special characters
+
+Return ONLY this JSON, nothing else:
+{{
+  "is_resume": true or false,
+  "match_score": integer 0-100,
+  "skill_gaps": ["string"],
+  "strengths": ["string"],
+  "summary": "one plain sentence"
+}}"""
+
+    try:
+        result = groq_json(prompt)
+    except Exception as e:
+        print(f"Groq analyze error: {e}")
+        result = {"is_resume": True, "match_score": 50, "skill_gaps": [], "strengths": [],
+                  "summary": "Could not analyze — please review manually."}
+
+    result.setdefault("is_resume", True)
+    result.setdefault("match_score", 0)
+    result.setdefault("skill_gaps", [])
+    result.setdefault("strengths", [])
+    result.setdefault("summary", "")
+    return jsonify(result)
 
 
-# ── Build one resume PDF from structured data ─────────────────────────────────
+# ── Resume structure extraction ────────────────────────────────────────────
+def extract_resume_structure(resume_text: str) -> dict:
+    prompt = f"""You are a resume parser. Extract ALL content from this resume into structured JSON.
+Keep every detail — do not summarize or skip anything.
 
-def s(val):
-    """Safely convert None/any to stripped string."""
-    return str(val).strip() if val is not None else ''
+Resume Text:
+{resume_text}
 
+CRITICAL JSON RULES:
+- Double quotes only — NO apostrophes inside strings
+- No newlines inside string values
+
+Return ONLY this JSON (empty string or [] if not found):
+{{
+  "full_name": "", "email": "", "phone": "", "location": "",
+  "linkedin": "", "github": "", "website": "", "summary": "",
+  "education": [{{"degree":"","institution":"","year":"","grade":"","details":""}}],
+  "experience": [{{"title":"","company":"","duration":"","location":"","points":[""]}}],
+  "projects": [{{"name":"","tech":"","points":[""],"link":""}}],
+  "skills": {{"languages":"","frameworks":"","tools":"","other":""}},
+  "certifications": [""],
+  "achievements": [""],
+  "extra_sections": [{{"title":"","content":""}}]
+}}"""
+    return groq_json(prompt)
+
+
+# ── Colors ─────────────────────────────────────────────────────────────────
+DARK   = colors.HexColor("#1a1a1a")
+PURPLE = colors.HexColor("#6d28d9")
+MUTED  = colors.HexColor("#555555")
+SIDEBAR= colors.HexColor("#f8f7ff")
+BORDER = colors.HexColor("#e8e5de")
+
+
+# ── PDF builder ────────────────────────────────────────────────────────────
 def build_resume_pdf(structured: dict, filename: str = "") -> bytes:
     buf = io.BytesIO()
-    W = A4[0] - 4*cm
+    PAGE_W, _ = A4
+    MARGIN  = 1.5 * cm
+    LEFT_W  = 6 * cm
+    RIGHT_W = PAGE_W - LEFT_W - 2 * MARGIN
 
-    doc = SimpleDocTemplate(
-        buf, pagesize=A4,
-        leftMargin=2*cm, rightMargin=2*cm,
-        topMargin=2*cm, bottomMargin=2*cm
-    )
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+        leftMargin=MARGIN, rightMargin=MARGIN, topMargin=MARGIN, bottomMargin=MARGIN)
 
-    S = get_styles()
-    story = []
+    def style(name, **kw):
+        return ParagraphStyle(name, **kw)
 
-    # ── Header ────────────────────────────────────────────────────────────────
-    name = structured.get("full_name") or filename.rsplit(".", 1)[0]
-    story.append(Paragraph(name, S["name"]))
-    story.append(Spacer(1, 3))
+    ST = {
+        "name":   style("name",  fontName="Helvetica-Bold", fontSize=20, leading=24, textColor=DARK),
+        "sh":     style("sh",    fontName="Helvetica-Bold", fontSize=8,  leading=11, textColor=PURPLE, spaceBefore=10, spaceAfter=3),
+        "sb":     style("sb",    fontName="Helvetica",      fontSize=8,  leading=12, textColor=DARK),
+        "ss":     style("ss",    fontName="Helvetica",      fontSize=7,  leading=10, textColor=MUTED),
+        "mh":     style("mh",    fontName="Helvetica-Bold", fontSize=9,  leading=12, textColor=PURPLE, spaceBefore=8, spaceAfter=2),
+        "mbold":  style("mbold", fontName="Helvetica-Bold", fontSize=9,  leading=13, textColor=DARK),
+        "mbody":  style("mbody", fontName="Helvetica",      fontSize=8.5,leading=13, textColor=DARK),
+        "mmuted": style("mmuted",fontName="Helvetica",      fontSize=8,  leading=11, textColor=MUTED),
+        "bull":   style("bull",  fontName="Helvetica",      fontSize=8.5,leading=13, textColor=DARK, leftIndent=10),
+    }
 
-    contact_parts = []
+    c   = structured
+    B   = "•"
+    hr  = lambda w: HRFlowable(width=w, thickness=0.3, color=BORDER)
+    hrp = lambda w: HRFlowable(width=w, thickness=0.4, color=PURPLE, spaceAfter=4)
+
+    # ── Sidebar ────────────────────────────────────────────────────────────
+    left = []
+    left += [Paragraph("CONTACT", ST["sh"]), hr(LEFT_W - 0.4*cm), Spacer(1, 3)]
     for field in ["email", "phone", "location", "linkedin", "github", "website"]:
-        val = s(structured.get(field))
-        if val:
-            contact_parts.append(val)
-    if contact_parts:
-        story.append(Paragraph("  |  ".join(contact_parts), S["contact"]))
-    story.append(Spacer(1, 6))
-    story.append(hr(W))
+        if v := s(c.get(field)):
+            left += [Paragraph(v, ST["ss"]), Spacer(1, 2)]
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    summary = s(structured.get("summary"))
-    if summary:
-        story.append(Paragraph("PROFILE", S["h1"]))
-        story.append(hr(W))
-        story.append(Paragraph(summary, S["body"]))
-        story.append(Spacer(1, 6))
+    skills = c.get("skills") or {}
+    if not isinstance(skills, dict): skills = {}
+    if any(s(skills.get(k)) for k in ["languages","frameworks","tools","other"]):
+        left += [Paragraph("SKILLS", ST["sh"]), hr(LEFT_W - 0.4*cm), Spacer(1, 3)]
+        for label, key in [("Languages","languages"),("Frameworks","frameworks"),("Tools","tools"),("Other","other")]:
+            if v := s(skills.get(key)):
+                left += [Paragraph(f"<b>{label}</b>", ST["sb"]), Paragraph(v, ST["ss"]), Spacer(1, 4)]
 
-    # ── Experience ────────────────────────────────────────────────────────────
-    experience = structured.get("experience") or []
-    if experience:
-        story.append(Paragraph("EXPERIENCE", S["h1"]))
-        story.append(hr(W))
-        for exp in experience:
+    if edu_list := c.get("education") or []:
+        left += [Paragraph("EDUCATION", ST["sh"]), hr(LEFT_W - 0.4*cm), Spacer(1, 3)]
+        for edu in edu_list:
+            if deg := s(edu.get("degree")): left.append(Paragraph(f"<b>{deg}</b>", ST["sb"]))
+            if ins := s(edu.get("institution")): left.append(Paragraph(ins, ST["ss"]))
+            yr = "  |  ".join(filter(None, [s(edu.get("year")), s(edu.get("grade"))]))
+            if yr: left.append(Paragraph(yr, ST["ss"]))
+            left.append(Spacer(1, 5))
+
+    if certs := c.get("certifications") or []:
+        left += [Paragraph("CERTIFICATIONS", ST["sh"]), hr(LEFT_W - 0.4*cm), Spacer(1, 3)]
+        for cert in certs:
+            if v := s(cert): left += [Paragraph(f"{B} {v}", ST["ss"]), Spacer(1, 2)]
+
+    # ── Main content ───────────────────────────────────────────────────────
+    right = []
+    name = s(c.get("full_name")) or filename.rsplit(".", 1)[0]
+    right += [Paragraph(name, ST["name"]), Spacer(1, 2)]
+
+    if summ := s(c.get("summary")):
+        right += [Paragraph("PROFILE", ST["mh"]), hrp(RIGHT_W), Paragraph(summ, ST["mbody"]), Spacer(1, 4)]
+
+    if exps := c.get("experience") or []:
+        right += [Paragraph("EXPERIENCE", ST["mh"]), hrp(RIGHT_W)]
+        for exp in exps:
             title   = s(exp.get("title"))
             company = s(exp.get("company"))
             dur     = s(exp.get("duration"))
             loc     = s(exp.get("location"))
-
-            left  = f"<b>{title}</b>" + (f" — {company}" if company else "")
-            right_parts = []
-            if dur: right_parts.append(dur)
-            if loc: right_parts.append(loc)
-            right = "  |  ".join(right_parts)
-
-            story.append(Paragraph(left, S["bold"]))
-            if right:
-                story.append(Paragraph(right, S["muted"]))
+            left_t  = f"<b>{title}</b>" + (f" — {company}" if company else "")
+            right_t = "  |  ".join(filter(None, [dur, loc]))
+            t = Table([[Paragraph(left_t, ST["mbold"]), Paragraph(right_t, ST["mmuted"])]],
+                      colWidths=[RIGHT_W * 0.65, RIGHT_W * 0.35])
+            t.setStyle(TableStyle([
+                ("ALIGN",(1,0),(1,0),"RIGHT"),("VALIGN",(0,0),(-1,-1),"TOP"),
+                ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
+                ("TOPPADDING",(0,0),(-1,-1),0),("BOTTOMPADDING",(0,0),(-1,-1),2),
+            ]))
+            right.append(t)
             for pt in (exp.get("points") or []):
-                if s(pt):
-                    story.append(Paragraph(f"• {s(pt)}", S["bullet"]))
-            story.append(Spacer(1, 5))
+                if v := s(pt): right.append(Paragraph(f"{B} {v}", ST["bull"]))
+            right.append(Spacer(1, 5))
 
-    # ── Projects ──────────────────────────────────────────────────────────────
-    projects = structured.get("projects") or []
-    if projects:
-        story.append(Paragraph("PROJECTS", S["h1"]))
-        story.append(hr(W))
-        for proj in projects:
+    if projs := c.get("projects") or []:
+        right += [Paragraph("PROJECTS", ST["mh"]), hrp(RIGHT_W)]
+        for proj in projs:
             pname = s(proj.get("name"))
             tech  = s(proj.get("tech"))
             link  = s(proj.get("link"))
-
-            header = f"<b>{pname}</b>"
-            if tech:  header += f" <font size='8' color='#888880'>({tech})</font>"
-            if link:  header += f"  <font size='8' color='#6d28d9'>{link}</font>"
-            story.append(Paragraph(header, S["bold"]))
-
+            hdr   = f"<b>{pname}</b>"
+            if tech: hdr += f" <font size='7' color='#888880'>({tech})</font>"
+            if link: hdr += f"  <font size='7' color='#6d28d9'>{link}</font>"
+            right.append(Paragraph(hdr, ST["mbold"]))
             for pt in (proj.get("points") or []):
-                if s(pt):
-                    story.append(Paragraph(f"• {s(pt)}", S["bullet"]))
-            story.append(Spacer(1, 5))
+                if v := s(pt): right.append(Paragraph(f"{B} {v}", ST["bull"]))
+            right.append(Spacer(1, 5))
 
-    # ── Education ─────────────────────────────────────────────────────────────
-    education = structured.get("education") or []
-    if education:
-        story.append(Paragraph("EDUCATION", S["h1"]))
-        story.append(hr(W))
-        for edu in education:
-            degree  = s(edu.get("degree"))
-            inst    = s(edu.get("institution"))
-            year    = s(edu.get("year"))
-            grade   = s(edu.get("grade"))
-            details = s(edu.get("details"))
+    if achvs := c.get("achievements") or []:
+        right += [Paragraph("ACHIEVEMENTS", ST["mh"]), hrp(RIGHT_W)]
+        for a in achvs:
+            if v := s(a): right.append(Paragraph(f"{B} {v}", ST["bull"]))
+        right.append(Spacer(1, 4))
 
-            left  = f"<b>{degree}</b>" + (f" — {inst}" if inst else "")
-            right_parts = []
-            if year:  right_parts.append(year)
-            if grade: right_parts.append(grade)
+    for sec in (c.get("extra_sections") or []):
+        if (title := s(sec.get("title"))) and (content := s(sec.get("content"))):
+            right += [Paragraph(title.upper(), ST["mh"]), hrp(RIGHT_W),
+                      Paragraph(content, ST["mbody"]), Spacer(1, 4)]
 
-            story.append(Paragraph(left, S["bold"]))
-            if right_parts:
-                story.append(Paragraph("  |  ".join(right_parts), S["muted"]))
-            if details:
-                story.append(Paragraph(details, S["body"]))
-            story.append(Spacer(1, 5))
+    # ── Layout ────────────────────────────────────────────────────────────
+    def wrap(content, width, bg=None, lpad=8, tpad=8):
+        t = Table([[ content ]], colWidths=[width])
+        styles_list = [
+            ("VALIGN",(0,0),(-1,-1),"TOP"),
+            ("LEFTPADDING",(0,0),(-1,-1),lpad),
+            ("RIGHTPADDING",(0,0),(-1,-1),lpad),
+            ("TOPPADDING",(0,0),(-1,-1),tpad),
+            ("BOTTOMPADDING",(0,0),(-1,-1),tpad),
+        ]
+        if bg: styles_list.append(("BACKGROUND",(0,0),(-1,-1),bg))
+        t.setStyle(TableStyle(styles_list))
+        return t
 
-    # ── Skills ────────────────────────────────────────────────────────────────
-    skills = structured.get("skills") or {}
-    if not isinstance(skills, dict): skills = {}
-    skill_lines = []
-    labels = [("Languages", "languages"), ("Frameworks", "frameworks"), ("Tools", "tools"), ("Other", "other")]
-    for label, key in labels:
-        val = s(skills.get(key))
-        if val:
-            skill_lines.append(f"<b>{label}:</b> {val}")
-    if skill_lines:
-        story.append(Paragraph("SKILLS", S["h1"]))
-        story.append(hr(W))
-        for line in skill_lines:
-            story.append(Paragraph(line, S["body"]))
-        story.append(Spacer(1, 5))
+    layout = Table(
+        [[wrap(left, LEFT_W, bg=SIDEBAR), wrap(right, RIGHT_W, lpad=12)]],
+        colWidths=[LEFT_W + 0.4*cm, RIGHT_W + 0.8*cm]
+    )
+    layout.setStyle(TableStyle([
+        ("VALIGN",(0,0),(-1,-1),"TOP"),
+        ("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
+        ("TOPPADDING",(0,0),(-1,-1),0),("BOTTOMPADDING",(0,0),(-1,-1),0),
+        ("LINEAFTER",(0,0),(0,-1),0.5,BORDER),
+    ]))
 
-    # ── Certifications ────────────────────────────────────────────────────────
-    certs = structured.get("certifications") or []
-    if certs:
-        story.append(Paragraph("CERTIFICATIONS", S["h1"]))
-        story.append(hr(W))
-        for c in certs:
-            if s(c):
-                story.append(Paragraph(f"• {s(c)}", S["bullet"]))
-        story.append(Spacer(1, 5))
-
-    # ── Achievements ──────────────────────────────────────────────────────────
-    achievements = structured.get("achievements") or []
-    if achievements:
-        story.append(Paragraph("ACHIEVEMENTS", S["h1"]))
-        story.append(hr(W))
-        for a in achievements:
-            if s(a):
-                story.append(Paragraph(f"• {s(a)}", S["bullet"]))
-        story.append(Spacer(1, 5))
-
-    # ── Extra sections (clubs, languages spoken, etc.) ────────────────────────
-    extras = structured.get("extra_sections") or []
-    for section in extras:
-        title   = s(section.get("title"))
-        content = s(section.get("content"))
-        if title and content:
-            story.append(Paragraph(title.upper(), S["h1"]))
-            story.append(hr(W))
-            story.append(Paragraph(content, S["body"]))
-            story.append(Spacer(1, 5))
-
-    doc.build(story)
+    doc.build([layout])
     buf.seek(0)
     return buf.read()
 
 
-# ── Export endpoint ───────────────────────────────────────────────────────────
-import time
-
-@app.route('/ai/export-pdf', methods=['POST'])
+# ── Export endpoint ────────────────────────────────────────────────────────
+@app.route("/ai/export-pdf", methods=["POST"])
 def export_pdf():
-    import traceback
-    data = request.json
-    candidates = data.get('candidates', [])
-
+    candidates = request.json.get("candidates", [])
     if not candidates:
-        return jsonify({'error': 'No candidates provided'}), 400
+        return jsonify({"error": "No candidates provided"}), 400
 
     zip_buf = io.BytesIO()
-
     try:
-        with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
             for i, c in enumerate(candidates):
                 if i > 0:
-                    time.sleep(2)  # wait 2s between AI calls to avoid rate limit
-
-                resume_text = c.get("resume_text", "") or ""
-
+                    time.sleep(2)
+                resume_text = c.get("resume_text") or ""
                 try:
-                    if resume_text and len(resume_text) > 100:
-                        structured = extract_resume_structure(resume_text)
-                    else:
-                        raise ValueError("no resume text")
+                    structured = extract_resume_structure(resume_text) if len(resume_text) > 100 else None
+                    if not structured: raise ValueError("no text")
                 except Exception as e:
-                    print(f"AI parse failed for {c.get('filename')}: {e}, using fallback")
+                    print(f"AI parse failed for {c.get('filename')}: {e} — using fallback")
                     structured = {
-                        "full_name":      c.get("filename", "").rsplit(".", 1)[0],
-                        "email":          "",
-                        "phone":          "",
-                        "location":       "",
-                        "linkedin":       "",
-                        "github":         (c.get("github") or {}).get("username", "") or "",
-                        "website":        "",
-                        "summary":        c.get("summary", "") or "",
-                        "education":      [],
-                        "experience":     [],
-                        "projects":       [],
-                        "skills":         {"languages": "", "frameworks": "", "tools": "", "other": ""},
-                        "certifications": [],
-                        "achievements":   c.get("strengths") or [],
+                        "full_name": c.get("filename", "").rsplit(".", 1)[0],
+                        "email": "", "phone": "", "location": "",
+                        "linkedin": "", "github": (c.get("github") or {}).get("username", "") or "",
+                        "website": "", "summary": c.get("summary", "") or "",
+                        "education": [], "experience": [], "projects": [],
+                        "skills": {"languages": "", "frameworks": "", "tools": "", "other": ""},
+                        "certifications": [], "achievements": c.get("strengths") or [],
                         "extra_sections": []
                     }
-
                 try:
                     pdf_bytes = build_resume_pdf(structured, c.get("filename", "candidate.pdf"))
                 except Exception as e:
                     print(f"PDF build failed for {c.get('filename')}: {e}")
                     traceback.print_exc()
-                    continue  # skip this candidate, don't crash entire export
+                    continue
 
-                safe_name = c.get("filename", "candidate").rsplit(".", 1)[0]
-                safe_name = "".join(ch if ch.isalnum() or ch in " _-" else "_" for ch in safe_name)
-                zf.writestr(f"{safe_name}.pdf", pdf_bytes)
+                safe = "".join(ch if ch.isalnum() or ch in " _-" else "_"
+                               for ch in c.get("filename", "candidate").rsplit(".", 1)[0])
+                zf.writestr(f"{safe}.pdf", pdf_bytes)
 
     except Exception as e:
         traceback.print_exc()
-        return jsonify({'error': str(e)}), 500
+        return jsonify({"error": str(e)}), 500
 
     zip_buf.seek(0)
     content = zip_buf.read()
-
     if len(content) < 100:
-        return jsonify({'error': 'ZIP generation failed — no PDFs were created'}), 500
+        return jsonify({"error": "ZIP generation failed"}), 500
 
     return app.response_class(
-        content,
-        mimetype='application/zip',
-        headers={'Content-Disposition': 'attachment; filename=shortlisted_resumes.zip'}
+        content, mimetype="application/zip",
+        headers={"Content-Disposition": "attachment; filename=shortlisted_resumes.zip"}
     )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(port=8001, debug=True)

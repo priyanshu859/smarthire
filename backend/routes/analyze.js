@@ -8,39 +8,29 @@ const path = require('path');
 
 const upload = multer({ storage: multer.memoryStorage() });
 
+const ALLOWED_EXTS = new Set(['.pdf', '.doc', '.docx', '.txt']);
+const AI_SERVICE = 'http://localhost:8001';
+
+// ── Text extraction — O(n) where n = file size ────────────────────────────
 async function extractText(file) {
   const ext = path.extname(file.originalname).toLowerCase();
-
   if (ext === '.pdf') {
-    try {
-      const data = await pdfParse(file.buffer);
-      return data.text || '';
-    } catch {
-      return '';
-    }
+    try { return (await pdfParse(file.buffer)).text || ''; } catch { return ''; }
   }
-
   if (ext === '.docx' || ext === '.doc') {
-    try {
-      const result = await mammoth.extractRawText({ buffer: file.buffer });
-      return result.value || '';
-    } catch (e) {
-      return '';
-    }
+    try { return (await mammoth.extractRawText({ buffer: file.buffer })).value || ''; } catch { return ''; }
   }
-
-  if (ext === '.txt') {
-    return file.buffer.toString('utf-8');
-  }
-
+  if (ext === '.txt') return file.buffer.toString('utf-8');
   return '';
 }
 
+// ── GitHub username extraction — O(n) single regex pass ──────────────────
 function extractGithubUsername(text) {
   const match = text.match(/github\.com\/([a-zA-Z0-9_-]+)/i);
   return match ? match[1] : null;
 }
 
+// ── GitHub check — O(r) where r = repo count, max 100 ───────────────────
 async function checkGithub(username) {
   try {
     const res = await fetch(`https://api.github.com/users/${username}/repos?per_page=100`, {
@@ -49,132 +39,141 @@ async function checkGithub(username) {
     const repos = await res.json();
     if (!Array.isArray(repos)) return { verified: false, score: 0, details: 'No repos found' };
 
-    const now = new Date();
-    const sixMonthsAgo = new Date();
-    sixMonthsAgo.setMonth(now.getMonth() - 6);
-    const eightMonthsAgo = new Date();
-    eightMonthsAgo.setMonth(now.getMonth() - 8);
+    const now = Date.now();
+    const SIX_MONTHS_MS  = 6 * 30 * 24 * 60 * 60 * 1000;
+    const EIGHT_MONTHS_MS = 8 * 30 * 24 * 60 * 60 * 1000;
 
-    const validRepos = repos.filter(r => {
-      const created = new Date(r.created_at);
-      return created <= eightMonthsAgo && !r.fork;
-    });
+    let totalStars = 0;
+    let validRepos = 0;
+    let recentlyActive = 0;
+    const langSet = new Set();
 
-    const recentlyActive = repos.filter(r => {
-      const pushed = new Date(r.pushed_at);
-      return pushed >= sixMonthsAgo;
-    });
+    // Single O(r) pass — no separate filter/reduce calls
+    for (const r of repos) {
+      totalStars += r.stargazers_count;
+      if (r.language) langSet.add(r.language);
+      const age = now - new Date(r.created_at).getTime();
+      if (!r.fork && age >= EIGHT_MONTHS_MS) validRepos++;
+      if (now - new Date(r.pushed_at).getTime() <= SIX_MONTHS_MS) recentlyActive++;
+    }
 
-    const totalStars = repos.reduce((sum, r) => sum + r.stargazers_count, 0);
-    const languages = [...new Set(repos.map(r => r.language).filter(Boolean))];
-
-    let bonusScore = 0;
-    if (totalStars > 0) bonusScore += 5;
-    if (totalStars > 10) bonusScore += 5;
-    if (recentlyActive.length > 0) bonusScore += 10;
-    if (validRepos.length >= 2) bonusScore += 10;
+    const score =
+      (totalStars > 0 ? 5 : 0) +
+      (totalStars > 10 ? 5 : 0) +
+      (recentlyActive > 0 ? 10 : 0) +
+      (validRepos >= 2 ? 10 : 0);
 
     return {
-      verified: validRepos.length > 0,
-      score: bonusScore,
+      verified: validRepos > 0,
+      score,
       details: {
         totalRepos: repos.length,
-        validRepos: validRepos.length,
-        recentlyActive: recentlyActive.length,
+        validRepos,
+        recentlyActive,
         totalStars,
-        languages
+        languages: [...langSet]
       }
     };
-  } catch (err) {
+  } catch {
     return { verified: false, score: 0, details: 'GitHub check failed' };
   }
 }
 
+// ── AI call ────────────────────────────────────────────────────────────────
 async function analyzeWithAI(jobDescription, resumeText, pdfBuffer) {
-  const payload = {
-    jobDescription,
-    resumeText,
-    pdfBase64: pdfBuffer ? pdfBuffer.toString('base64') : null
-  };
-
-  const res = await fetch('http://localhost:8001/ai/analyze', {
+  const res = await fetch(`${AI_SERVICE}/ai/analyze`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
+    body: JSON.stringify({
+      jobDescription,
+      resumeText,
+      pdfBase64: pdfBuffer ? pdfBuffer.toString('base64') : null
+    })
   });
-  return await res.json();
+  return res.json();
 }
 
+// ── Garbage result factory ─────────────────────────────────────────────────
+const garbageResult = (filename, reason) => ({
+  filename,
+  is_resume: false,
+  match_score: 0,
+  strengths: [],
+  skill_gaps: [],
+  summary: reason,
+  resume_text: '',
+  github: { username: null, verified: false, details: 'N/A' },
+  shortlisted: false
+});
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// ── Main route ─────────────────────────────────────────────────────────────
 router.post('/analyze-bulk', upload.array('resumes', 100), async (req, res) => {
   const { jobDescription } = req.body;
   if (!jobDescription) return res.status(400).json({ error: 'Job description required' });
   if (!req.files?.length) return res.status(400).json({ error: 'No resumes uploaded' });
 
   try {
-    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
     const results = [];
+
     for (let i = 0; i < req.files.length; i++) {
+      if (i > 0) await sleep(1500); // respect Groq 12k TPM limit
+
       const file = req.files[i];
-      if (i > 0) await sleep(1500); // 1.5s gap between each — stays under 12k TPM
-      const result = await (async (file) => {
-        const ext = path.extname(file.originalname).toLowerCase();
-        const allowed = ['.pdf', '.doc', '.docx', '.txt'];
+      const ext = path.extname(file.originalname).toLowerCase();
 
-        if (!allowed.includes(ext)) {
-          return {
-            filename: file.originalname,
-            is_resume: false,
-            match_score: 0,
-            strengths: [],
-            skill_gaps: [],
-            summary: 'Unsupported file type',
-            resume_text: '',
-            github: { username: null, verified: false, details: 'N/A' },
-            shortlisted: false
-          };
+      // 1. Unsupported extension → reject without AI call
+      if (!ALLOWED_EXTS.has(ext)) {
+        results.push(garbageResult(file.originalname, 'Unsupported file type'));
+        continue;
+      }
+
+      const resumeText = await extractText(file);
+      const needsOCR = ext === '.pdf' && !resumeText.trim();
+
+      // 2. AI decides is_resume
+      const aiResult = await analyzeWithAI(jobDescription, resumeText, needsOCR ? file.buffer : null);
+
+      // 3. Not a resume → reject
+      if (aiResult.is_resume === false) {
+        results.push(garbageResult(file.originalname, aiResult.summary || 'Not a resume'));
+        continue;
+      }
+
+      // 4. Valid resume — GitHub + scoring
+      const githubUsername = extractGithubUsername(resumeText);
+      const githubData = githubUsername
+        ? await checkGithub(githubUsername)
+        : { verified: false, score: 0, details: 'No GitHub link found' };
+
+      const finalScore = Math.min(100, (aiResult.match_score || 0) + githubData.score);
+
+      // Fire-and-forget DB insert — don't block the response
+      pool.query(
+        'INSERT INTO analyses (job_description, resume_text, match_score, skill_gaps) VALUES ($1, $2, $3, $4)',
+        [jobDescription, resumeText.slice(0, 5000), finalScore, aiResult.skill_gaps]
+      ).catch(err => console.error('DB insert error:', err));
+
+      results.push({
+        filename: file.originalname,
+        ...aiResult,
+        is_resume: true,
+        match_score: finalScore,
+        shortlisted: finalScore >= 70,
+        resume_text: resumeText.slice(0, 8000),
+        github: {
+          username: githubUsername,
+          verified: githubData.verified,
+          details: githubData.details
         }
-
-        const resumeText = await extractText(file);
-        const needsOCR = ext === '.pdf' && !resumeText.trim();
-        const aiResult = await analyzeWithAI(
-          jobDescription,
-          resumeText,
-          needsOCR ? file.buffer : null
-        );
-
-        const githubUsername = extractGithubUsername(resumeText);
-        let githubData = { verified: false, score: 0, details: 'No GitHub link found' };
-        if (githubUsername) {
-          githubData = await checkGithub(githubUsername);
-        }
-
-        const finalScore = Math.min(100, (aiResult.match_score || 0) + githubData.score);
-        const shortlisted = finalScore >= 70;
-
-        await pool.query(
-          'INSERT INTO analyses (job_description, resume_text, match_score, skill_gaps) VALUES ($1, $2, $3, $4)',
-          [jobDescription, resumeText.slice(0, 5000), finalScore, aiResult.skill_gaps]
-        );
-
-        return {
-          filename: file.originalname,
-          ...aiResult,
-          match_score: finalScore,
-          shortlisted,
-          resume_text: resumeText.slice(0, 8000), // ← send full text to frontend for PDF export
-          github: {
-            username: githubUsername,
-            verified: githubData.verified,
-            details: githubData.details
-          }
-        };
-      })(file);
-      results.push(result);
+      });
     }
 
+    // Sort descending by score — O(n log n)
     results.sort((a, b) => b.match_score - a.match_score);
     res.json({ candidates: results, total: results.length });
+
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
