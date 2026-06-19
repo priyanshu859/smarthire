@@ -23,10 +23,10 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
-        os.getenv("FRONTEND_URL", "http://localhost:3000"),
+        "https://accomplished-respect-production-12ef.up.railway.app"
     ],
-    allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type", "Authorization"],
+    allow_methods=["*"],
+    allow_headers=["*"],
     allow_credentials=True,
 )
 
