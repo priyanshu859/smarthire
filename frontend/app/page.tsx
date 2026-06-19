@@ -124,7 +124,7 @@ export default function Home() {
     formData.append('jobDescription', jobDescription);
     Array.from(resumes).forEach(file => formData.append('resumes', file));
     try {
-      const res = await fetch('http://localhost:8080/api/analyze-bulk', {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/api/analyze-bulk`, {
         method: 'POST',
         body: formData,
       });
