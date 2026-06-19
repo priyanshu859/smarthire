@@ -19,3 +19,4 @@ out/
 backend/.env
 backend/.env.save
 ai-service/.env
+frontend/smarthire_dump.sql

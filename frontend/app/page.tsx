@@ -37,8 +37,8 @@ const Footer = ({ centered = false }: { centered?: boolean }) => (
     <div className={styles.footerRight}>
       <span>Developed by : Priyanshu Solanki</span>
       <span className={styles.footerDot}>·</span>
-      <a href="https://github.com/priyanshu850" target="_blank" rel="noreferrer">GitHub</a>
-      <a href="https://linkedin.com/in/priyanshu-solanki" target="_blank" rel="noreferrer">LinkedIn</a>
+      <a href="https://github.com/priyanshu859" target="_blank" rel="noreferrer">GitHub</a>
+      <a href="https://www.linkedin.com/in/priyanshusolanki-dev/" target="_blank" rel="noreferrer">LinkedIn</a>
     </div>
   </footer>
 );
