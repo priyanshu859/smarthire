@@ -5,11 +5,18 @@ const multer = require('multer');
 const pdfParse = require('pdf-parse');
 const mammoth = require('mammoth');
 const path = require('path');
+const rateLimit = require('express-rate-limit');
 
 const upload = multer({ storage: multer.memoryStorage() });
 
 const ALLOWED_EXTS = new Set(['.pdf', '.doc', '.docx', '.txt']);
-const AI_SERVICE = 'http://localhost:8001';
+const AI_SERVICE = process.env.AI_SERVICE_URL || 'http://localhost:8001';
+
+const bulkLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 10,                   // 10 bulk requests per IP
+  message: { error: 'Too many requests, please try again later.' }
+});
 
 // ── Text extraction — O(n) where n = file size ────────────────────────────
 async function extractText(file) {
@@ -34,13 +41,16 @@ function extractGithubUsername(text) {
 async function checkGithub(username) {
   try {
     const res = await fetch(`https://api.github.com/users/${username}/repos?per_page=100`, {
-      headers: { 'User-Agent': 'SmartHire-App' }
+      headers: {
+        'User-Agent': 'SmartHire-App',
+        ...(process.env.GITHUB_TOKEN && { Authorization: `Bearer ${process.env.GITHUB_TOKEN}` })
+      }
     });
     const repos = await res.json();
     if (!Array.isArray(repos)) return { verified: false, score: 0, details: 'No repos found' };
 
     const now = Date.now();
-    const SIX_MONTHS_MS  = 6 * 30 * 24 * 60 * 60 * 1000;
+    const SIX_MONTHS_MS   = 6 * 30 * 24 * 60 * 60 * 1000;
     const EIGHT_MONTHS_MS = 8 * 30 * 24 * 60 * 60 * 1000;
 
     let totalStars = 0;
@@ -109,7 +119,7 @@ const garbageResult = (filename, reason) => ({
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ── Main route ─────────────────────────────────────────────────────────────
-router.post('/analyze-bulk', upload.array('resumes', 100), async (req, res) => {
+router.post('/analyze-bulk', bulkLimiter, upload.array('resumes', 100), async (req, res) => {
   const { jobDescription } = req.body;
   if (!jobDescription) return res.status(400).json({ error: 'Job description required' });
   if (!req.files?.length) return res.status(400).json({ error: 'No resumes uploaded' });
@@ -136,7 +146,7 @@ router.post('/analyze-bulk', upload.array('resumes', 100), async (req, res) => {
       const aiResult = await analyzeWithAI(jobDescription, resumeText, needsOCR ? file.buffer : null);
 
       // 3. Not a resume → reject
-      if (aiResult.is_resume === false) {
+      if (aiResult.is_resume !== true) {
         results.push(garbageResult(file.originalname, aiResult.summary || 'Not a resume'));
         continue;
       }
@@ -175,8 +185,26 @@ router.post('/analyze-bulk', upload.array('resumes', 100), async (req, res) => {
     res.json({ candidates: results, total: results.length });
 
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error('Bulk analyze error:', err);
+    res.status(500).json({ error: 'Internal server error' });
   }
+});
+
+// ── Seeker: extract text from uploaded resume file ─────────────────────────
+router.post('/extract-text', upload.single('resume'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+  const ext = path.extname(req.file.originalname).toLowerCase();
+  if (!ALLOWED_EXTS.has(ext)) return res.status(400).json({ error: 'Unsupported file type' });
+
+  const resumeText = await extractText(req.file);
+  const needsOCR = ext === '.pdf' && !resumeText.trim();
+
+  const aiResult = await analyzeWithAI('', resumeText, needsOCR ? req.file.buffer : null);
+  if (aiResult.is_resume !== true) {
+    return res.status(400).json({ error: 'Not a resume. Please upload a valid resume file.' });
+  }
+
+  res.json({ text: resumeText });
 });
 
 module.exports = router;

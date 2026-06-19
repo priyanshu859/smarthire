@@ -21,13 +21,19 @@ app = FastAPI(title="SmartHire AI Service", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[
+        "http://localhost:3000",
+        os.getenv("FRONTEND_URL", "http://localhost:3000"),
+    ],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "Authorization"],
+    allow_credentials=True,
 )
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL = "llama-3.1-8b-instant"
+MAX_INPUT_CHARS = 12000
+MAX_PDF_BASE64_CHARS = 7 * 1024 * 1024  # ~5MB PDF in base64
 
 
 class AnalyzeRequest(BaseModel):
@@ -46,6 +52,30 @@ class ExportRequest(BaseModel):
     candidates: list[Candidate] = []
 
 
+# ---- Step 4b: Job Seeker ATS schema ----
+
+class ATSUserRequest(BaseModel):
+    jobDescription: str | None = None
+    resumeText: str = ""
+
+class BulletRewrite(BaseModel):
+    original: str = ""
+    improved: str = ""
+
+class ATSBreakdown(BaseModel):
+    skills_match: int = 0
+    experience_match: int = 0
+    keyword_match: int = 0
+
+class ATSUserResult(BaseModel):
+    is_resume: bool = True
+    match_score: int = 0
+    breakdown: ATSBreakdown = ATSBreakdown()
+    matched_keywords: list[str] = []
+    missing_keywords: list[str] = []
+    bullet_rewrites: list[BulletRewrite] = []
+    summary: str = ""
+
 def extract_text_with_ocr(pdf_bytes: bytes) -> str:
     try:
         return "\n".join(pytesseract.image_to_string(img) for img in convert_from_bytes(pdf_bytes)).strip()
@@ -57,7 +87,8 @@ def groq_json(prompt: str) -> dict:
     response = client.chat.completions.create(
         model=MODEL,
         messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"}
+        response_format={"type": "json_object"},
+        temperature=0
     )
     return json.loads(response.choices[0].message.content)
 
@@ -71,6 +102,8 @@ async def analyze(body: AnalyzeRequest):
     job_description = body.jobDescription
     resume_text = body.resumeText
 
+    if body.pdfBase64 and len(body.pdfBase64) > MAX_PDF_BASE64_CHARS:
+        raise HTTPException(status_code=400, detail="File size must be under 5MB")
     if body.pdfBase64:
         resume_text = extract_text_with_ocr(base64.b64decode(body.pdfBase64))
 
@@ -89,21 +122,42 @@ Mark is_resume as FALSE immediately if the document is any of:
 - A study plan, grind plan, learning roadmap, or weekly schedule
   (contains phrases like "Week 1", "Day 1", "hrs/day", "Daily Schedule",
    "10-Week", "phase 1", "time block", "LPA target", "roadmap", "grind plan")
+- A skill roadmap, market-research report, or career-planning document
+  (contains phrases like "Skills to Add", "Skills to Learn", "Priority Order",
+   "Market Research", "Salary Trajectory", "What You Already Have", "What's Missing",
+   "Interview risk", or suggested "Resume line:" bullets). A document organized
+   around what skills to learn, add, or acquire NEXT is a plan, not a resume —
+   even if it also lists the person's current real skills with proof points.
 - A task list, to-do list, or project plan
 - An article, blog post, research paper, invoice, or report
 - Any document describing a PLAN or SCHEDULE rather than a PERSON's background
 
 Mark is_resume as TRUE only if ALL of these are present:
 - A person's name
-- Contact info (email or phone)
-- At least one of: work experience, education, or skills section
+- An actual email address or phone number — a GitHub or LinkedIn URL alone
+  does NOT count as contact info
+- At least one of: work experience, education, or a skills section presented
+  as part of a finished profile (not framed as skills still to be learned)
 
 If text is empty or unreadable: is_resume=true, score=50.
 
-STEP 2 — If is_resume is true, score it against the job description.
+STEP 2 — If is_resume is true, score it against the job description:
+- strengths: skills, tools, or experience from the job description that genuinely
+  appear in the resume text. Only include something here if it is explicitly stated
+  in the resume.
+- skill_gaps: requirements from the job description that do NOT appear anywhere in
+  the resume text. Before listing something as a gap, check whether it is already
+  mentioned in the resume's skills or experience — if it is, it belongs in strengths,
+  not skill_gaps.
+- strengths and skill_gaps must be mutually exclusive: the same skill can never
+  appear in both lists.
+
+If is_resume is false: set match_score to 0, skill_gaps and strengths to empty
+lists, and write a one-sentence summary explaining specifically why this document
+is not a resume.
 
 CRITICAL JSON RULES:
-- Double quotes only — NO apostrophes inside strings (write "candidates background" not "candidate's background")
+- Double quotes only — NO apostrophes inside strings
 - No newlines inside string values
 - summary = one plain sentence, no special characters
 
@@ -120,16 +174,113 @@ Return ONLY this JSON, nothing else:
         result = groq_json(prompt)
     except Exception as e:
         print(f"Groq analyze error: {e}")
-        result = {"is_resume": True, "match_score": 50, "skill_gaps": [], "strengths": [],
+        result = {"is_resume": True, "match_score": 0, "skill_gaps": [], "strengths": [],
                   "summary": "Could not analyze — please review manually."}
 
-    result.setdefault("is_resume", True)
+    result.setdefault("is_resume", False)
     result.setdefault("match_score", 0)
     result.setdefault("skill_gaps", [])
     result.setdefault("strengths", [])
     result.setdefault("summary", "")
     return result
 
+
+@app.post("/ats/user", response_model=ATSUserResult)
+async def ats_user(body: ATSUserRequest):
+    resume_text = body.resumeText.strip()
+    job_description = (body.jobDescription or "").strip()
+
+    if not resume_text:
+        raise HTTPException(status_code=400, detail="resumeText is required")
+    resume_text = resume_text[:MAX_INPUT_CHARS]
+    job_description = job_description[:MAX_INPUT_CHARS]
+
+    if job_description:
+        score_instruction = "Score how well this resume matches the job description as an ATS would (0-100)."
+        jd_section = f"Job Description:\n{job_description}\n\n"
+        keyword_instruction = (
+            "matched_keywords: important keywords/skills from the JD that ARE literally present in "
+            "the resume (max 10). missing_keywords: important keywords/skills from the JD that are NOT "
+            "present (max 10). They must be mutually exclusive — verify presence before counting a "
+            "keyword as matched; if unsure, put it in missing_keywords instead."
+        )
+    else:
+        score_instruction = "Score this resume on general quality (0-100): impact of bullets, action verbs, quantification, formatting clarity, section completeness. No JD was provided."
+        jd_section = ""
+        keyword_instruction = (
+            "matched_keywords: strong keywords/action verbs already present in the resume. "
+            "missing_keywords: important keywords/action verbs that would strengthen it. "
+            "They must be mutually exclusive."
+        )
+
+    prompt = f"""You are an expert ATS (Applicant Tracking System) analyzer and resume coach.
+
+{jd_section}Resume Text:
+{resume_text}
+
+STEP 1 — IS THIS A RESUME?
+Mark is_resume as FALSE immediately if the document is any of:
+- A study plan, grind plan, learning roadmap, or weekly schedule
+  (contains phrases like "Week 1", "Day 1", "hrs/day", "Daily Schedule",
+   "10-Week", "phase 1", "time block", "LPA target", "roadmap", "grind plan")
+- A task list, to-do list, or project plan
+- An article, blog post, research paper, invoice, or report
+- Any document describing a PLAN or SCHEDULE rather than a PERSON's background
+
+Mark is_resume as TRUE only if ALL of these are present:
+- A person's name
+- Contact info (email or phone)
+- At least one of: work experience, education, or skills section
+
+If is_resume is FALSE: set match_score=0, all breakdown fields to 0, empty keyword
+lists, empty bullet_rewrites, and write a one-sentence summary explaining why this
+isn't a resume. Do not continue to STEP 2.
+
+STEP 2 — If is_resume is true:
+1. {score_instruction}
+2. Break the score into three sub-scores (0-100): skills_match, experience_match, keyword_match
+3. {keyword_instruction}
+4. Up to 3 bullet rewrites from actual resume bullets — do NOT invent bullets or fake metrics.
+5. One-sentence summary of overall fit.
+
+CRITICAL JSON RULES:
+- Double quotes only — NO apostrophes inside strings
+- No newlines inside string values
+
+Return ONLY this JSON, nothing else:
+{{
+  "is_resume": true or false,
+  "match_score": integer 0-100,
+  "breakdown": {{"skills_match": integer, "experience_match": integer, "keyword_match": integer}},
+  "matched_keywords": ["string"],
+  "missing_keywords": ["string"],
+  "bullet_rewrites": [{{"original": "string", "improved": "string"}}],
+  "summary": "one plain sentence"
+}}"""
+
+    try:
+        result = groq_json(prompt)
+    except Exception as e:
+        print(f"Groq ATS error: {e}")
+        result = {
+            "is_resume": False,
+            "match_score": 0,
+            "breakdown": {"skills_match": 0, "experience_match": 0, "keyword_match": 0},
+            "matched_keywords": [], "missing_keywords": [], "bullet_rewrites": [],
+            "summary": "Could not analyze - please try again.",
+        }
+
+    result.setdefault("is_resume", False)
+    result.setdefault("match_score", 0)
+    breakdown = result.setdefault("breakdown", {})
+    breakdown.setdefault("skills_match", 0)
+    breakdown.setdefault("experience_match", 0)
+    breakdown.setdefault("keyword_match", 0)
+    result.setdefault("matched_keywords", [])
+    result.setdefault("missing_keywords", [])
+    result.setdefault("bullet_rewrites", [])
+    result.setdefault("summary", "")
+    return result
 
 def extract_resume_structure(resume_text: str) -> dict:
     prompt = f"""You are a resume parser. Extract ALL content from this resume into structured JSON.
@@ -360,4 +511,5 @@ async def export_pdf(body: ExportRequest):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8001, reload=True)
+    port = int(os.getenv("PORT", 8001))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)

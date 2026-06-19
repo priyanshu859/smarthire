@@ -1,0 +1,7 @@
+{
+  "dependencies": {
+    "@auth/pg-adapter": "^1.11.2",
+    "next-auth": "^4.24.14",
+    "pg": "^8.21.0"
+  }
+}

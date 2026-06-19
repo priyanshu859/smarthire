@@ -1,12 +1,12 @@
 # Node
 node_modules/
 .env
+.env.*
 
 # Python
 venv/
 __pycache__/
 *.pyc
-.env
 
 # OS
 .DS_Store
@@ -14,3 +14,8 @@ __pycache__/
 # Next.js
 .next/
 out/
+
+# Env files (never commit these)
+backend/.env
+backend/.env.save
+ai-service/.env
