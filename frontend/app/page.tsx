@@ -152,7 +152,7 @@ export default function Home() {
     if (shortlisted.length === 0) return;
     setExportLoading(true);
     try {
-      const res = await fetch('http://localhost:8001/ai/export-pdf', {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_AI_URL}/ai/export-pdf`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ candidates: shortlisted }),
@@ -224,7 +224,7 @@ export default function Home() {
       if (seekerInputMode === 'file' && seekerResumeFile) {
         const formData = new FormData();
         formData.append('resume', seekerResumeFile);
-        const extractRes = await fetch('http://localhost:8080/api/extract-text', {
+        const extractRes = await fetch(`${process.env.NEXT_PUBLIC_BACKEND_URL}/api/extract-text`, {
           method: 'POST',
           body: formData,
         });
@@ -233,7 +233,7 @@ export default function Home() {
         if (!extractData.text) throw new Error('Could not extract text from file');
         resumeText = extractData.text;
       }
-      const validateRes = await fetch('http://localhost:8001/ai/analyze', {
+      const validateRes = await fetch(`${process.env.NEXT_PUBLIC_AI_URL}/ai/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ resumeText, jobDescription: '' }),
@@ -242,7 +242,7 @@ export default function Home() {
       if (validateData.is_resume === false) {
         throw new Error('This file does not appear to be a resume. Please upload a valid resume.');
       }
-      const atsRes = await fetch('http://localhost:8001/ats/user', {
+      const atsRes = await fetch(`${process.env.NEXT_PUBLIC_AI_URL}/ats/user`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ resumeText, jobDescription: seekerJD || undefined }),
