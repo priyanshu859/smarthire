@@ -13,9 +13,9 @@ app.use(helmet());
 // CORS - sirf frontend allow
 app.use(cors({
   origin: [
-    'http://localhost:3000',
-    'https://accomplished-respect-production-12ef.up.railway.app'
-  ],
+  'http://localhost:3000',
+  process.env.FRONTEND_URL
+],
   methods: ['GET', 'POST', 'DELETE'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true

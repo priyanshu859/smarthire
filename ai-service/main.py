@@ -21,10 +21,10 @@ app = FastAPI(title="SmartHire AI Service", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://accomplished-respect-production-12ef.up.railway.app"
-    ],
+allow_origins=[
+    "http://localhost:3000",
+    os.getenv("FRONTEND_URL")
+],
     allow_methods=["*"],
     allow_headers=["*"],
     allow_credentials=True,
