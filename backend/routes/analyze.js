@@ -100,6 +100,13 @@ async function analyzeWithAI(jobDescription, resumeText, pdfBuffer) {
       pdfBase64: pdfBuffer ? pdfBuffer.toString('base64') : null
     })
   });
+
+  if (!res.ok) {
+    const errorText = await res.text();
+    console.error(`AI service error [${res.status}]:`, errorText.slice(0, 300));
+    throw new Error(`AI service returned ${res.status}`);
+  }
+
   return res.json();
 }
 
@@ -196,15 +203,18 @@ router.post('/extract-text', upload.single('resume'), async (req, res) => {
   const ext = path.extname(req.file.originalname).toLowerCase();
   if (!ALLOWED_EXTS.has(ext)) return res.status(400).json({ error: 'Unsupported file type' });
 
-  const resumeText = await extractText(req.file);
-  const needsOCR = ext === '.pdf' && !resumeText.trim();
+  try {
+    const resumeText = await extractText(req.file);
+    const needsOCR = ext === '.pdf' && !resumeText.trim();
 
-  const aiResult = await analyzeWithAI('', resumeText, needsOCR ? req.file.buffer : null);
-  if (aiResult.is_resume !== true) {
-    return res.status(400).json({ error: 'Not a resume. Please upload a valid resume file.' });
+    const aiResult = await analyzeWithAI('', resumeText, needsOCR ? req.file.buffer : null);
+    if (aiResult.is_resume !== true) {
+      return res.status(400).json({ error: 'Not a resume. Please upload a valid resume file.' });
+    }
+
+    res.json({ text: resumeText });
+  } catch (err) {
+    console.error('Extract-text error:', err);
+    res.status(500).json({ error: 'Failed to process resume. Please try again.' });
   }
-
-  res.json({ text: resumeText });
 });
-
-module.exports = router;
