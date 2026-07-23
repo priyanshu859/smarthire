@@ -218,3 +218,4 @@ router.post('/extract-text', upload.single('resume'), async (req, res) => {
     res.status(500).json({ error: 'Failed to process resume. Please try again.' });
   }
 });
+module.exports = router;
